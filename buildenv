@@ -9,9 +9,24 @@ XSIMD_VERSION="14.3.0"
 ###   # Xsimd is mandatory as its CPU feature detection is the basis for
 ###   # Arrow CpuInfo
 ###
-### The headers install cleanly. What does NOT work yet is using them: see
-### zopen_install_caveats() and the README. This port exists so the headers are
-### available and so the diagnosis is written down somewhere it will be found.
+### It works here through xsimd's emulated backend, which implements batches
+### with scalar code. That is a deliberate trade and the reason is not that
+### this machine lacks vector hardware -- it has it, and a plain vector add at
+### -march=z14 runs correctly. It is that the vector path cannot currently be
+### compiled:
+###
+###   - xsimd gates the z Vector Extension on __VEC__ >= 10304 && __ARCH__ >= 12.
+###     z/OS defaults to __ARCH__ 10 and spells the macro __VX__, so nothing is
+###     detected and any batch use is a hard static_assert.
+###   - Supplying -march=z14 -fzvector fixes that -- both macros then appear and
+###     xsimd enables VXE -- but xsimd then includes <vecintrin.h>, and that
+###     header does not parse in C++ once <complex> has been included, which
+###     xsimd does because it supports complex batches.
+###
+### The emulated backend sidesteps the second problem entirely: no intrinsics,
+### no <vecintrin.h>, correct results, no vectorisation. The flags that select
+### it are exported to dependents by zopen_append_to_env below, so a consumer
+### such as Arrow picks them up without knowing any of this.
 ###
 
 export ZOPEN_PROJECT_NAME="xsimd"
@@ -36,16 +51,16 @@ export ZOPEN_INSTALL="cmake"
 export ZOPEN_INSTALL_OPTS="--install ../build"
 export ZOPEN_CHECK="skip"
 
-# The flags a consumer needs to get VXE detected. They are exported for
-# dependents even though the resulting build does not yet compile, because
-# getting them wrong is a separate failure from the one described in the
-# caveats and it is worth not having both at once.
+# The flags that make xsimd usable here, exported to dependents below.
 #
-#   -march=z14   raises __ARCH__ to 12; the default is 10
-#   -fzvector    defines __VEC__ 10304 and enables the vector language extension
+#   XSIMD_WITH_EMULATED=1                    make the emulated backend available
+#   XSIMD_DEFAULT_ARCH=xsimd::emulated<128>  and make it the default
 #
-# xsimd's gate is: defined(__VEC__) && __VEC__ >= 10304 && __ARCH__ >= 12
-export XSIMD_ZOS_CXXFLAGS="-march=z14 -fzvector"
+# 128 bits is the natural width to ask for: it matches the z vector registers,
+# so if the vector path is ever fixed the lane counts do not change underneath
+# anyone.
+XSIMD_ZOS_CXXFLAGS="-DXSIMD_WITH_EMULATED=1 -DXSIMD_DEFAULT_ARCH=xsimd::emulated<128>"
+export XSIMD_ZOS_CXXFLAGS
 
 zopen_post_install() {
   printHeader "Checking what xsimd can and cannot do here"
@@ -70,31 +85,62 @@ HDREOF
     return 1
   fi
 
-  # 2. Instantiating a batch is what Arrow needs and what does not work.
-  #    Reported, not failed: the README explains why the port ships anyway.
+  # 2. A batch must instantiate, and must compute the right answer. The
+  #    second half matters more than the first: the emulated backend is
+  #    scalar code standing in for vector code, and a wrong result there
+  #    would be silent.
   cat > /tmp/zopen_xsimd_batch.cpp <<'BATCHEOF'
 #include <xsimd/xsimd.hpp>
 #include <cstdio>
+#include <vector>
 int main() {
-    using B = xsimd::batch<float>;
-    std::printf("%zu\n", (size_t)B::size);
+    using B = xsimd::batch<float, xsimd::default_arch>;
+    std::printf("arch=%s lanes=%zu\n",
+                xsimd::default_arch::name(), (size_t)B::size);
+    std::vector<float> a(64, 2.0f), b(64, 3.0f), r(64, 0.0f);
+    for (std::size_t i = 0; i + B::size <= a.size(); i += B::size) {
+        auto va = B::load_unaligned(&a[i]);
+        auto vb = B::load_unaligned(&b[i]);
+        (va * vb).store_unaligned(&r[i]);
+    }
+    for (std::size_t i = 0; i < r.size(); ++i) {
+        if (r[i] != 6.0f) {
+            std::printf("wrong result at %zu: %f\n", i, r[i]);
+            return 1;
+        }
+    }
     return 0;
 }
 BATCHEOF
   chtag -tc IBM-1047 /tmp/zopen_xsimd_batch.cpp 2> /dev/null
   # shellcheck disable=SC2086
-  if "${CXX:-clang++}" ${CXXFLAGS} -std=c++17 ${XSIMD_ZOS_CXXFLAGS} -I"${_xs_inc}" \
+  if ! "${CXX:-clang++}" ${CXXFLAGS} -std=c++17 ${XSIMD_ZOS_CXXFLAGS} -I"${_xs_inc}" \
       /tmp/zopen_xsimd_batch.cpp -o /tmp/zopen_xsimd_batch 2> /tmp/zopen_xsimd_batch.err; then
-    printInfo "KNOWN-ISSUE: xsimd::batch now COMPILES with ${XSIMD_ZOS_CXXFLAGS}."
-    printInfo "             The blocker described in the README may be fixed;"
-    printInfo "             re-check before trusting it, then try Arrow C++."
-  else
-    printInfo "KNOWN-ISSUE: xsimd::batch does not compile, as documented."
-    head -2 /tmp/zopen_xsimd_batch.err 2> /dev/null | while read -r _xs_l; do
-      printInfo "             ${_xs_l}"
+    printSoftError "FAIL: xsimd::batch does not compile with ${XSIMD_ZOS_CXXFLAGS}"
+    head -3 /tmp/zopen_xsimd_batch.err 2> /dev/null | while read -r _xs_l; do
+      printSoftError "  ${_xs_l}"
     done
+    return 1
   fi
-  rm -f /tmp/zopen_xsimd_hdr* /tmp/zopen_xsimd_batch*
+  if ! /tmp/zopen_xsimd_batch; then
+    printSoftError "FAIL: xsimd batch arithmetic is wrong"
+    return 1
+  fi
+  printInfo "PASS: batches instantiate and compute correctly ($(/tmp/zopen_xsimd_batch 2>/dev/null; true))"
+
+  # 3. The vector path, reported and not failed. If this ever starts working
+  #    the emulated default can be dropped and the kernels get vectorised.
+  # shellcheck disable=SC2086
+  if "${CXX:-clang++}" ${CXXFLAGS} -std=c++17 -march=z14 -fzvector -I"${_xs_inc}" \
+      /tmp/zopen_xsimd_batch.cpp -o /tmp/zopen_xsimd_vec 2> /dev/null; then
+    printInfo "KNOWN-ISSUE: the VXE vector path now compiles too. <vecintrin.h>"
+    printInfo "             may be fixed; if so, drop the emulated default."
+  else
+    printInfo "KNOWN-ISSUE: the VXE vector path still does not compile"
+    printInfo "             (<vecintrin.h> after <complex>), so the emulated"
+    printInfo "             backend remains the default. Correct, not vectorised."
+  fi
+  rm -f /tmp/zopen_xsimd_hdr* /tmp/zopen_xsimd_batch* /tmp/zopen_xsimd_vec
   return 0
 }
 
@@ -107,32 +153,35 @@ expectedTotalTests:1
 ZZ
 }
 
+# Dependents get the include path AND the flags that make xsimd work here.
+# Without the latter a consumer compiles against headers that cannot produce a
+# batch, and finds out deep inside its own build -- which for Arrow means
+# several hundred targets in.
 zopen_append_to_env() {
 cat <<ZZ
 if [ ! -z "\$ZOPEN_IN_ZOPEN_BUILD" ]; then
-  export ZOPEN_EXTRA_CXXFLAGS="\${ZOPEN_EXTRA_CXXFLAGS} -I\$PWD/include"
+  export ZOPEN_EXTRA_CXXFLAGS="\${ZOPEN_EXTRA_CXXFLAGS} -I\$PWD/include ${XSIMD_ZOS_CXXFLAGS}"
 fi
 ZZ
 }
 
 zopen_install_caveats() {
   cat <<'CAVEATEOF'
-The headers install, but xsimd::batch cannot be instantiated on this platform.
+xsimd works here through its emulated backend: batches are scalar code, so
+results are correct but nothing is vectorised.
 
-Without vector flags, xsimd detects no SIMD architecture at all and any use of
-a batch type is a hard compile error:
+The machine is not the limitation -- it has vector hardware and a plain vector
+add compiles and runs. The limitation is that xsimd's VXE path includes
+<vecintrin.h>, and that header does not parse in C++ once <complex> has been
+included, which xsimd does.
 
-    static_assert failed: "No SIMD architecture detected, cannot instantiate a
-    batch"
+If you use this port through zopen the flags are applied for you. Compiling by
+hand, you need:
 
-With -march=z14 -fzvector, xsimd correctly detects the z Vector Extension and
-includes <vecintrin.h> -- which then fails to parse, because that header is not
-self-contained in C++ once <complex> has been included, and xsimd includes
-<complex>.
+    -DXSIMD_WITH_EMULATED=1 -DXSIMD_DEFAULT_ARCH=xsimd::emulated<128>
 
-So anything that uses xsimd batches, Arrow C++ included, will not build here
-yet. Installing this port makes the headers available and records the
-diagnosis; it does not make xsimd usable. See the README.
+Without them xsimd detects no SIMD architecture at all and any use of a batch
+type is a hard compile error rather than a slow one.
 CAVEATEOF
 }
 

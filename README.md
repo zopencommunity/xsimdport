@@ -3,11 +3,9 @@
 [xsimd](https://github.com/xtensor-stack/xsimd) 14.3.0 — header-only C++
 wrappers over SIMD intrinsics.
 
-> [!WARNING]
-> **The headers install, but `xsimd::batch` cannot be instantiated here.**
-> Anything that uses xsimd batches — Arrow C++ included — will not build yet.
-> This port makes the headers available and records the diagnosis; it does not
-> make xsimd usable.
+**Working, through the emulated backend.** Batches are implemented with scalar
+code: correct results, no vectorisation. If you use the port through zopen the
+flags are applied for you.
 
 ## Why this port exists
 
@@ -22,51 +20,81 @@ resolve_dependency(xsimd ...)
 So xsimd is on the critical path for Arrow, which makes its state worth pinning
 down precisely rather than discovering inside a six-hour Arrow build.
 
-## What is wrong
+## How it works, and why it is scalar
 
-There are two states and neither works.
-
-**Without vector flags** xsimd detects no SIMD architecture at all, and any use
-of a batch type is a hard compile error:
+The machine is not the limitation. It has vector hardware, and a plain vector
+add compiles and runs correctly at `-march=z14`:
 
 ```
-static_assert failed due to requirement 'supported_architecture'
-"No SIMD architecture detected, cannot instantiate a batch"
+vec: 11 22 33 44
 ```
 
-The reason is a macro spelling. xsimd's gate for the z Vector Extension is:
+The limitation is that xsimd's vector path cannot be compiled here, in two
+stages.
+
+**First, nothing is detected.** xsimd gates the z Vector Extension on:
 
 ```c
 #if defined(__VEC__) && __VEC__ >= 10304 && __ARCH__ >= 12
 #define XSIMD_WITH_VXE 1
 ```
 
-and z/OS defaults to `__ARCH__ 10` with no `__VEC__` at all — it defines
-`__VX__` instead, which is the z/OS spelling.
+z/OS defaults to `__ARCH__ 10` and spells the macro `__VX__`, not `__VEC__`, so
+`XSIMD_WITH_VXE` is 0 and any use of a batch type is a hard error:
 
-**With `-march=z14 -fzvector`** both macros appear (`__ARCH__ 12`,
-`__VEC__ 10304`), xsimd correctly enables VXE, and then fails differently:
+```
+static_assert failed: "No SIMD architecture detected, cannot instantiate a batch"
+```
+
+**Second, fixing that exposes a compiler-header defect.** `-march=z14 -fzvector`
+supplies both macros (`__ARCH__ 12`, `__VEC__ 10304`), xsimd correctly enables
+VXE — and then includes `<vecintrin.h>`, which fails to parse:
 
 ```
 /usr/lpp/IBM/oelcpp/v2r0/lib/clang/14.0.0/include/vecintrin.h:30:1:
 error: expected unqualified-id
 ```
 
-That is IBM's own vector-intrinsics header, and the cause is not xsimd:
+That is IBM's own header, and the trigger is include order:
 
 | included first | `#include <vecintrin.h>` |
 | --- | --- |
-| *nothing* | OK |
-| `<type_traits>`, `<cstddef>`, `<limits>`, `<cstdint>` | OK |
+| *nothing*, `<type_traits>`, `<cstddef>`, `<limits>`, `<cstdint>` | OK |
 | **`<complex>`** | **breaks** |
 
-`vecintrin.h` is not self-contained in C++ once `<complex>` has been included,
-and xsimd includes `<complex>` because it supports complex batches. Forcing
-`-include vecintrin.h` ahead of everything does not help either.
+`vecintrin.h` is only self-contained when included first, and xsimd includes
+`<complex>` because it supports complex batches. **This is worth raising with
+the compiler team** — it will hit anyone doing s390x vector work in C++, not
+just xsimd.
 
-So the blocker is a compiler-header defect, not a porting gap in xsimd. Worth
-raising with the compiler team — a header that only parses when included first
-is a bug regardless of who hits it.
+## What the port does instead
+
+It selects xsimd's emulated backend, which implements batches with scalar code
+and never includes `<vecintrin.h>`:
+
+```
+-DXSIMD_WITH_EMULATED=1 -DXSIMD_DEFAULT_ARCH=xsimd::emulated<128>
+```
+
+giving:
+
+```
+arch=emulated lanes=4
+2*3 = 6.0
+```
+
+128 bits is the natural width to ask for — it matches the z vector registers, so
+if the vector path is ever fixed the lane counts do not change underneath
+anyone.
+
+Dependents receive these flags automatically through `zopen_append_to_env`,
+because a consumer that gets the headers without them compiles against an xsimd
+that cannot produce a batch, and finds out deep inside its own build. For Arrow
+that would be several hundred targets in.
+
+The check asserts both halves on every build: that batches instantiate, and
+that they compute the right answer. The second matters more — scalar code
+standing in for vector code would fail silently.
 
 ## Things already ruled out
 
@@ -80,21 +108,17 @@ is a bug regardless of who hits it.
 * **The hardware is fine.** A plain vector add compiled with `-march=z14` runs
   correctly: `vec: 11 22 33 44`.
 
-## What would unblock it
+## Getting the vector path back
 
-Any one of:
+The emulated backend costs vectorisation, so it is worth revisiting if
+`<vecintrin.h>` is ever fixed. The check reports the vector path's status on
+every build, so the day it starts compiling will not be missed — at which point
+the emulated default can simply be dropped.
 
-1. A fix to `vecintrin.h` so it is self-contained in C++ (the real fix).
-2. An xsimd change that includes `<vecintrin.h>` before `<complex>` reaches
-   the translation unit — harder than it sounds, since the include order is
-   driven by the consumer.
-3. Getting xsimd's emulated (scalar) backend working. `XSIMD_WITH_EMULATED`
-   exists and gets past the "no SIMD architecture" assert, but needs the
-   default arch pointed at `xsimd::emulated<N>` as well; that was not pursued.
-   It would cost the vectorisation but unblock Arrow, which is likely the right
-   trade for a first port.
-
-Option 3 is the one to try first if Arrow is the goal.
+The other route, if the header is not going to change, is an xsimd patch that
+keeps `<vecintrin.h>` out of any translation unit that has seen `<complex>`.
+That is harder than it sounds, because the include order is driven by the
+consumer rather than by xsimd.
 
 ## Installing
 
