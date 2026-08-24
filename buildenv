@@ -20,32 +20,16 @@ export ZOPEN_CATEGORIES="development library math"
 
 export ZOPEN_STABLE_URL="https://github.com/xtensor-stack/xsimd.git"
 export ZOPEN_STABLE_TAG="${XSIMD_VERSION}"
-export ZOPEN_STABLE_DEPS="make cmake"
+export ZOPEN_STABLE_DEPS="zoslib make cmake"
 
 export ZOPEN_DEV_URL="https://github.com/xtensor-stack/xsimd.git"
 export ZOPEN_DEV_DEPS="${ZOPEN_STABLE_DEPS}"
 
-# Header-only: nothing is compiled, so no zoslib and no compiled artifact.
-export ZOPEN_DONT_ADD_ZOSLIB_DEP=1
 export ZOPEN_COMP="CLANG"
 
-# See snappyport for why the compiler has to be named rather than left to
-# CMake. Here it matters less -- nothing is compiled -- but CMake still probes
-# for a compiler before it will configure anything.
-if [ -z "${CC}" ] || [ ! -x "${CC}" ]; then
-  ZOPEN_CLANG=$(ls -1 /usr/lpp/IBM/oelcpp/*/bin/clang 2> /dev/null | tail -1)
-else
-  ZOPEN_CLANG="${CC}"
-fi
-if [ -z "${ZOPEN_CLANG}" ] || [ ! -x "${ZOPEN_CLANG}" ]; then
-  echo "Could not find a clang to build with; set CC" >&2
-  return 4
-fi
-ZOPEN_CLANGXX="${ZOPEN_CLANG}++"
-[ -x "${ZOPEN_CLANGXX}" ] || ZOPEN_CLANGXX="${ZOPEN_CLANG}"
 
 export ZOPEN_CONFIGURE="cmake"
-export ZOPEN_CONFIGURE_OPTS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${ZOPEN_CLANG} -DCMAKE_CXX_COMPILER=${ZOPEN_CLANGXX} -DBUILD_TESTS=OFF -B ../build --install-prefix \"\$ZOPEN_INSTALL_DIR/\" ."
+export ZOPEN_CONFIGURE_OPTS="-DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -B ../build --install-prefix \"\$ZOPEN_INSTALL_DIR/\" ."
 # Nothing to build: the CMake target is an INTERFACE library.
 export ZOPEN_MAKE="skip"
 export ZOPEN_INSTALL="cmake"
@@ -78,7 +62,7 @@ zopen_post_install() {
 int main() { return 0; }
 HDREOF
   chtag -tc IBM-1047 /tmp/zopen_xsimd_hdr.cpp 2> /dev/null
-  if "${ZOPEN_CLANGXX}" -m64 -std=c++17 -I"${_xs_inc}" \
+  if "${CXX:-clang++}" ${CXXFLAGS} -std=c++17 -I"${_xs_inc}" \
       /tmp/zopen_xsimd_hdr.cpp -o /tmp/zopen_xsimd_hdr 2> /dev/null; then
     printInfo "PASS: the headers parse"
   else
@@ -99,7 +83,7 @@ int main() {
 BATCHEOF
   chtag -tc IBM-1047 /tmp/zopen_xsimd_batch.cpp 2> /dev/null
   # shellcheck disable=SC2086
-  if "${ZOPEN_CLANGXX}" -m64 -std=c++17 ${XSIMD_ZOS_CXXFLAGS} -I"${_xs_inc}" \
+  if "${CXX:-clang++}" ${CXXFLAGS} -std=c++17 ${XSIMD_ZOS_CXXFLAGS} -I"${_xs_inc}" \
       /tmp/zopen_xsimd_batch.cpp -o /tmp/zopen_xsimd_batch 2> /tmp/zopen_xsimd_batch.err; then
     printInfo "KNOWN-ISSUE: xsimd::batch now COMPILES with ${XSIMD_ZOS_CXXFLAGS}."
     printInfo "             The blocker described in the README may be fixed;"
