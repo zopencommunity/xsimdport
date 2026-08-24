@@ -1,0 +1,157 @@
+# bump: xsimd-version /XSIMD_VERSION="(.*)"/ https://github.com/xtensor-stack/xsimd.git|semver:*
+XSIMD_VERSION="14.3.0"
+
+###
+### xsimd is a header-only C++ wrapper over SIMD intrinsics. It is here because
+### Arrow C++ requires it -- not optionally, and not only for vectorised
+### kernels:
+###
+###   # Xsimd is mandatory as its CPU feature detection is the basis for
+###   # Arrow CpuInfo
+###
+### The headers install cleanly. What does NOT work yet is using them: see
+### zopen_install_caveats() and the README. This port exists so the headers are
+### available and so the diagnosis is written down somewhere it will be found.
+###
+
+export ZOPEN_PROJECT_NAME="xsimd"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_CATEGORIES="development library math"
+
+export ZOPEN_STABLE_URL="https://github.com/xtensor-stack/xsimd.git"
+export ZOPEN_STABLE_TAG="${XSIMD_VERSION}"
+export ZOPEN_STABLE_DEPS="make cmake"
+
+export ZOPEN_DEV_URL="https://github.com/xtensor-stack/xsimd.git"
+export ZOPEN_DEV_DEPS="${ZOPEN_STABLE_DEPS}"
+
+# Header-only: nothing is compiled, so no zoslib and no compiled artifact.
+export ZOPEN_DONT_ADD_ZOSLIB_DEP=1
+export ZOPEN_COMP="CLANG"
+
+# See snappyport for why the compiler has to be named rather than left to
+# CMake. Here it matters less -- nothing is compiled -- but CMake still probes
+# for a compiler before it will configure anything.
+if [ -z "${CC}" ] || [ ! -x "${CC}" ]; then
+  ZOPEN_CLANG=$(ls -1 /usr/lpp/IBM/oelcpp/*/bin/clang 2> /dev/null | tail -1)
+else
+  ZOPEN_CLANG="${CC}"
+fi
+if [ -z "${ZOPEN_CLANG}" ] || [ ! -x "${ZOPEN_CLANG}" ]; then
+  echo "Could not find a clang to build with; set CC" >&2
+  return 4
+fi
+ZOPEN_CLANGXX="${ZOPEN_CLANG}++"
+[ -x "${ZOPEN_CLANGXX}" ] || ZOPEN_CLANGXX="${ZOPEN_CLANG}"
+
+export ZOPEN_CONFIGURE="cmake"
+export ZOPEN_CONFIGURE_OPTS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${ZOPEN_CLANG} -DCMAKE_CXX_COMPILER=${ZOPEN_CLANGXX} -DBUILD_TESTS=OFF -B ../build --install-prefix \"\$ZOPEN_INSTALL_DIR/\" ."
+# Nothing to build: the CMake target is an INTERFACE library.
+export ZOPEN_MAKE="skip"
+export ZOPEN_INSTALL="cmake"
+export ZOPEN_INSTALL_OPTS="--install ../build"
+export ZOPEN_CHECK="skip"
+
+# The flags a consumer needs to get VXE detected. They are exported for
+# dependents even though the resulting build does not yet compile, because
+# getting them wrong is a separate failure from the one described in the
+# caveats and it is worth not having both at once.
+#
+#   -march=z14   raises __ARCH__ to 12; the default is 10
+#   -fzvector    defines __VEC__ 10304 and enables the vector language extension
+#
+# xsimd's gate is: defined(__VEC__) && __VEC__ >= 10304 && __ARCH__ >= 12
+export XSIMD_ZOS_CXXFLAGS="-march=z14 -fzvector"
+
+zopen_post_install() {
+  printHeader "Checking what xsimd can and cannot do here"
+  _xs_inc="${ZOPEN_INSTALL_DIR}/include"
+  if [ ! -f "${_xs_inc}/xsimd/xsimd.hpp" ]; then
+    printSoftError "xsimd/xsimd.hpp is not installed"
+    return 1
+  fi
+  printInfo "- headers installed"
+
+  # 1. The headers must at least parse. This is the part that works.
+  cat > /tmp/zopen_xsimd_hdr.cpp <<'HDREOF'
+#include <xsimd/xsimd.hpp>
+int main() { return 0; }
+HDREOF
+  chtag -tc IBM-1047 /tmp/zopen_xsimd_hdr.cpp 2> /dev/null
+  if "${ZOPEN_CLANGXX}" -m64 -std=c++17 -I"${_xs_inc}" \
+      /tmp/zopen_xsimd_hdr.cpp -o /tmp/zopen_xsimd_hdr 2> /dev/null; then
+    printInfo "PASS: the headers parse"
+  else
+    printSoftError "FAIL: xsimd/xsimd.hpp does not even parse"
+    return 1
+  fi
+
+  # 2. Instantiating a batch is what Arrow needs and what does not work.
+  #    Reported, not failed: the README explains why the port ships anyway.
+  cat > /tmp/zopen_xsimd_batch.cpp <<'BATCHEOF'
+#include <xsimd/xsimd.hpp>
+#include <cstdio>
+int main() {
+    using B = xsimd::batch<float>;
+    std::printf("%zu\n", (size_t)B::size);
+    return 0;
+}
+BATCHEOF
+  chtag -tc IBM-1047 /tmp/zopen_xsimd_batch.cpp 2> /dev/null
+  # shellcheck disable=SC2086
+  if "${ZOPEN_CLANGXX}" -m64 -std=c++17 ${XSIMD_ZOS_CXXFLAGS} -I"${_xs_inc}" \
+      /tmp/zopen_xsimd_batch.cpp -o /tmp/zopen_xsimd_batch 2> /tmp/zopen_xsimd_batch.err; then
+    printInfo "KNOWN-ISSUE: xsimd::batch now COMPILES with ${XSIMD_ZOS_CXXFLAGS}."
+    printInfo "             The blocker described in the README may be fixed;"
+    printInfo "             re-check before trusting it, then try Arrow C++."
+  else
+    printInfo "KNOWN-ISSUE: xsimd::batch does not compile, as documented."
+    head -2 /tmp/zopen_xsimd_batch.err 2> /dev/null | while read -r _xs_l; do
+      printInfo "             ${_xs_l}"
+    done
+  fi
+  rm -f /tmp/zopen_xsimd_hdr* /tmp/zopen_xsimd_batch*
+  return 0
+}
+
+zopen_check_results() {
+cat <<ZZ
+actualFailures:0
+totalTests:1
+expectedFailures:0
+expectedTotalTests:1
+ZZ
+}
+
+zopen_append_to_env() {
+cat <<ZZ
+if [ ! -z "\$ZOPEN_IN_ZOPEN_BUILD" ]; then
+  export ZOPEN_EXTRA_CXXFLAGS="\${ZOPEN_EXTRA_CXXFLAGS} -I\$PWD/include"
+fi
+ZZ
+}
+
+zopen_install_caveats() {
+  cat <<'CAVEATEOF'
+The headers install, but xsimd::batch cannot be instantiated on this platform.
+
+Without vector flags, xsimd detects no SIMD architecture at all and any use of
+a batch type is a hard compile error:
+
+    static_assert failed: "No SIMD architecture detected, cannot instantiate a
+    batch"
+
+With -march=z14 -fzvector, xsimd correctly detects the z Vector Extension and
+includes <vecintrin.h> -- which then fails to parse, because that header is not
+self-contained in C++ once <complex> has been included, and xsimd includes
+<complex>.
+
+So anything that uses xsimd batches, Arrow C++ included, will not build here
+yet. Installing this port makes the headers available and records the
+diagnosis; it does not make xsimd usable. See the README.
+CAVEATEOF
+}
+
+zopen_get_version() {
+  echo "${XSIMD_VERSION}"
+}
