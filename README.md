@@ -109,6 +109,36 @@ The check asserts both halves on every build: that batches instantiate, and
 that they compute the right answer. The second matters more — scalar code
 standing in for vector code would fail silently.
 
+## The other z/OS patch: posix_memalign
+
+`xsimd_aligned_allocator.hpp` allocates with `posix_memalign`, which is
+unusable here below the z/OS 3.1 library level. zoslib's `stdlib.h` does:
+
+```c
+// LE fix since posix_memalign is exposed in 2.5
+#if (__TARGET_LIB__ < 0x43010000)
+#define posix_memalign __posix_memalign_replaced
+#endif
+```
+
+and nothing anywhere declares or defines `__posix_memalign_replaced` — it is
+not in `libzoslib.a` either. The name is effectively poisoned, so any use fails
+to compile. zopen targets `zosv2r5` by default, so this is the ordinary case
+rather than an edge one, and it needs **both** `ZOSLIB_OVERRIDE_CLIB=1` and the
+older target to bite — which is why it does not show up in a casual test.
+
+The patch uses `aligned_alloc`, whose result is released with plain `free()` —
+which is what `xaligned_free` already does. One measured detail matters: z/OS
+enforces the C11 rule that the size be an integer multiple of the alignment.
+
+| call | result |
+| --- | --- |
+| `aligned_alloc(64, 100)` | **NULL** |
+| `aligned_alloc(64, 128)` | ok, correctly aligned |
+| `aligned_alloc(4096, 4096)` | ok, correctly aligned |
+
+Most platforms relax that; this one does not, so the request is rounded up.
+
 ## Things already ruled out
 
 * **Not the macro spelling alone.** Patching xsimd's gate to accept `__VX__`

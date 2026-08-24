@@ -1,0 +1,31 @@
+--- a/include/xsimd/memory/xsimd_aligned_allocator.hpp
++++ b/include/xsimd/memory/xsimd_aligned_allocator.hpp
+@@ -284,6 +284,28 @@
+             void* res = nullptr;
+ #ifdef _WIN32
+             res = _aligned_malloc(size, alignment);
++#elif defined(__MVS__)
++            // posix_memalign is unusable on z/OS below the 3.1 library level.
++            // zoslib's stdlib.h does
++            //
++            //     #if (__TARGET_LIB__ < 0x43010000)
++            //     #define posix_memalign __posix_memalign_replaced
++            //
++            // and nothing declares or defines that replacement, so the name is
++            // effectively poisoned and any use fails to compile.
++            //
++            // aligned_alloc is available, and xaligned_free below releases with
++            // plain free(), which is what aligned_alloc requires. z/OS enforces
++            // the C11 rule that the size be a multiple of the alignment -- it
++            // returns NULL otherwise -- so the request is rounded up.
++            {
++                size_t padded = (size + alignment - 1) / alignment * alignment;
++                if (padded == 0)
++                {
++                    padded = alignment;
++                }
++                res = aligned_alloc(alignment, padded);
++            }
+ #else
+             if (posix_memalign(&res, alignment, size) != 0)
+             {
