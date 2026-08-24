@@ -51,16 +51,23 @@ export ZOPEN_INSTALL="cmake"
 export ZOPEN_INSTALL_OPTS="--install ../build"
 export ZOPEN_CHECK="skip"
 
-# The flags that make xsimd usable here, exported to dependents below.
+# What makes xsimd usable here, delivered as a force-included header rather
+# than as -D flags.
 #
-#   XSIMD_WITH_EMULATED=1                    make the emulated backend available
-#   XSIMD_DEFAULT_ARCH=xsimd::emulated<128>  and make it the default
+# The settings cannot survive as ordinary flags: XSIMD_DEFAULT_ARCH's value
+# contains angle brackets, and once a build system has passed
 #
-# 128 bits is the natural width to ask for: it matches the z vector registers,
-# so if the vector path is ever fixed the lane counts do not change underneath
-# anyone.
-XSIMD_ZOS_CXXFLAGS="-DXSIMD_WITH_EMULATED=1 -DXSIMD_DEFAULT_ARCH=xsimd::emulated<128>"
-export XSIMD_ZOS_CXXFLAGS
+#   -DXSIMD_DEFAULT_ARCH=xsimd::emulated<128>
+#
+# through a shell, "<128>" has been read as a redirection --
+#
+#   bad file descriptor "128"
+#
+# which is exactly how Arrow's CMake compiler probe failed. The header keeps
+# shell metacharacters off the command line; zoslib delivers its symbolfixes
+# the same way.
+XSIMD_ZOS_HEADER="xsimd-zos-defaults.h"
+export XSIMD_ZOS_HEADER
 
 zopen_post_install() {
   printHeader "Checking what xsimd can and cannot do here"
@@ -70,6 +77,16 @@ zopen_post_install() {
     return 1
   fi
   printInfo "- headers installed"
+
+  # Ship the z/OS defaults header next to xsimd's own headers, so a consumer
+  # that force-includes it needs only the one include path.
+  if ! cp "${ZOPEN_ROOT}/${XSIMD_ZOS_HEADER}" "${_xs_inc}/${XSIMD_ZOS_HEADER}"; then
+    printSoftError "Could not install ${XSIMD_ZOS_HEADER}"
+    return 1
+  fi
+  chtag -tc ISO8859-1 "${_xs_inc}/${XSIMD_ZOS_HEADER}" 2> /dev/null
+  printInfo "- installed ${XSIMD_ZOS_HEADER}"
+  _xs_force="-include ${_xs_inc}/${XSIMD_ZOS_HEADER}"
 
   # 1. The headers must at least parse. This is the part that works.
   cat > /tmp/zopen_xsimd_hdr.cpp <<'HDREOF'
@@ -114,9 +131,9 @@ int main() {
 BATCHEOF
   chtag -tc IBM-1047 /tmp/zopen_xsimd_batch.cpp 2> /dev/null
   # shellcheck disable=SC2086
-  if ! "${CXX:-clang++}" ${CXXFLAGS} -std=c++17 ${XSIMD_ZOS_CXXFLAGS} -I"${_xs_inc}" \
+  if ! "${CXX:-clang++}" ${CXXFLAGS} -std=c++17 ${_xs_force} -I"${_xs_inc}" \
       /tmp/zopen_xsimd_batch.cpp -o /tmp/zopen_xsimd_batch 2> /tmp/zopen_xsimd_batch.err; then
-    printSoftError "FAIL: xsimd::batch does not compile with ${XSIMD_ZOS_CXXFLAGS}"
+    printSoftError "FAIL: xsimd::batch does not compile with ${_xs_force}"
     head -3 /tmp/zopen_xsimd_batch.err 2> /dev/null | while read -r _xs_l; do
       printSoftError "  ${_xs_l}"
     done
@@ -160,7 +177,7 @@ ZZ
 zopen_append_to_env() {
 cat <<ZZ
 if [ ! -z "\$ZOPEN_IN_ZOPEN_BUILD" ]; then
-  export ZOPEN_EXTRA_CXXFLAGS="\${ZOPEN_EXTRA_CXXFLAGS} -I\$PWD/include ${XSIMD_ZOS_CXXFLAGS}"
+  export ZOPEN_EXTRA_CXXFLAGS="\${ZOPEN_EXTRA_CXXFLAGS} -I\$PWD/include -include \$PWD/include/${XSIMD_ZOS_HEADER}"
 fi
 ZZ
 }

@@ -73,24 +73,37 @@ It selects xsimd's emulated backend, which implements batches with scalar code
 and never includes `<vecintrin.h>`:
 
 ```
--DXSIMD_WITH_EMULATED=1 -DXSIMD_DEFAULT_ARCH=xsimd::emulated<128>
-```
-
-giving:
-
-```
 arch=emulated lanes=4
 2*3 = 6.0
 ```
+
+The settings are delivered as a **force-included header**, not as `-D` flags,
+and that is not a stylistic choice. `XSIMD_DEFAULT_ARCH`'s value contains angle
+brackets, and once a build system has passed
+
+```
+-DXSIMD_DEFAULT_ARCH=xsimd::emulated<128>
+```
+
+through a shell, `<128>` has been read as a redirection:
+
+```
+bad file descriptor "128"
+```
+
+which is exactly how Arrow's CMake compiler probe failed. `xsimd-zos-defaults.h`
+keeps shell metacharacters off the command line; zoslib delivers its
+`zos-v2r5-symbolfixes.h` the same way. Both macros in it are guarded, so a
+consumer that wants to choose differently can define either first and keep it.
 
 128 bits is the natural width to ask for — it matches the z vector registers, so
 if the vector path is ever fixed the lane counts do not change underneath
 anyone.
 
-Dependents receive these flags automatically through `zopen_append_to_env`,
-because a consumer that gets the headers without them compiles against an xsimd
-that cannot produce a batch, and finds out deep inside its own build. For Arrow
-that would be several hundred targets in.
+Dependents receive the include path and the force-include automatically through
+`zopen_append_to_env`, because a consumer that gets the headers without them
+compiles against an xsimd that cannot produce a batch and finds out deep inside
+its own build. For Arrow that would be several hundred targets in.
 
 The check asserts both halves on every build: that batches instantiate, and
 that they compute the right answer. The second matters more — scalar code
